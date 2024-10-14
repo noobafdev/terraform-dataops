@@ -1,0 +1,154 @@
+name: Terraform and API Deployment
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy_and_test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up AWS Credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: echo "AWS credentials configured."
+
+      - name: Define Environment Variables
+        run: |
+          echo "AMI_ID=${{ secrets.AMI_ID }}" >> $GITHUB_ENV
+          echo "DB_CREDENTIALS_ARN=${{ secrets.DB_CREDENTIALS_ARN }}" >> $GITHUB_ENV
+          echo "DB_NAME=${{ secrets.DB_NAME }}" >> $GITHUB_ENV
+          echo "DB_USERNAME=${{ secrets.DB_USERNAME }}" >> $GITHUB_ENV
+          echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> $GITHUB_ENV
+          echo "EC2_KEY_NAME=${{ secrets.EC2_KEY_NAME }}" >> $GITHUB_ENV
+          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+
+      - name: Create terraform.tfvars
+        run: |
+          cd terraform
+          cat <<EOF > terraform.tfvars
+          ami_id = "$AMI_ID"
+          db_credentials_arn = "$DB_CREDENTIALS_ARN"
+          db_name = "$DB_NAME"
+          db_username = "$DB_USERNAME"
+          db_password = "$DB_PASSWORD"
+          ec2_key_name = "$EC2_KEY_NAME"
+          EOF
+
+      - name: Terraform Init
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          cd terraform
+          terraform init -no-color
+
+      - name: Terraform Validate
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          cd terraform
+          terraform validate -no-color    
+
+      - name: Terraform Plan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          cd terraform
+          terraform plan -var-file=terraform.tfvars -no-color
+
+      - name: Terraform Apply
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          cd terraform
+          terraform apply -var-file=terraform.tfvars -auto-approve -no-color
+
+      - name: Extract Terraform Outputs
+        id: extract_outputs
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          cd terraform
+          OUTPUT_JSON=$(terraform output -json)
+          S3_BUCKET_NAME=$(echo $OUTPUT_JSON | jq -r '.s3_bucket_name.value')
+          INSTANCE_IDS=$(echo $OUTPUT_JSON | jq -r '.ec2_instance_ids.value | join(",")')
+          FIRST_INSTANCE_ID=$(echo $INSTANCE_IDS | cut -d, -f1)
+          ALB_DNS_NAME=$(echo $OUTPUT_JSON | jq -r '.alb_dns_name.value')
+
+          echo "S3_BUCKET_NAME=${S3_BUCKET_NAME}" >> $GITHUB_ENV
+          echo "FIRST_INSTANCE_ID=${FIRST_INSTANCE_ID}" >> $GITHUB_ENV
+          echo "ALB_DNS_NAME=${ALB_DNS_NAME}" >> $GITHUB_ENV  # Export ALB DNS name
+
+      - name: Zip the API files
+        run: |
+          cd api
+          zip -r fastapi-app.zip app/ requirements.txt Dockerfile
+
+      - name: Upload to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          S3_BUCKET_NAME: ${{ env.S3_BUCKET_NAME }}
+        run: |
+          aws s3 cp api/fastapi-app.zip s3://$S3_BUCKET_NAME/ --region eu-west-2
+
+      - name: Deploy API to EC2 using SSM
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          INSTANCE_ID: ${{ env.FIRST_INSTANCE_ID }}
+          S3_BUCKET_NAME: ${{ env.S3_BUCKET_NAME }}
+        run: |
+          aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters 'commands=[
+              "sudo yum update -y",
+              "sudo yum install python3 python3-pip unzip -y",
+              "mkdir -p /home/ssm-user/app",
+              "aws s3 cp s3://'$S3_BUCKET_NAME'/fastapi-app.zip /home/ssm-user/fastapi-app.zip --region eu-west-2",
+              "unzip -o /home/ssm-user/fastapi-app.zip -d /home/ssm-user/app",
+              "cd /home/ssm-user/app",
+              "pip3 install -r requirements.txt",
+              "nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 &"
+          ]' \
+          --comment "Deploy FastAPI app to EC2" \
+          --timeout-seconds 600 \
+          --region eu-west-2
+
+      - name: Run API Tests
+        run: |
+          sleep 30  # Increased wait time for the FastAPI app and ALB to be fully operational
+          MAX_RETRIES=5
+          RETRY_DELAY=10
+
+          for ((i=1;i<=MAX_RETRIES;i++)); do
+            RESPONSE=$(curl -s http://$ALB_DNS_NAME)
+
+            if [[ "$RESPONSE" == *"Hello, World!"* ]]; then
+                echo "API is up and responding correctly."
+                exit 0
+            else
+                echo "API did not respond correctly. Response: $RESPONSE"
+                echo "Retrying in $RETRY_DELAY seconds..."
+                sleep $RETRY_DELAY
+            fi
+          done
+
+          echo "API failed to respond correctly after $MAX_RETRIES attempts."
+          exit 1
+
+      - name: Cleanup
+        run: |
+          echo "Cleaning up any resources if necessary."
